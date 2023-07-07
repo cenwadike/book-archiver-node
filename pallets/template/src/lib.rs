@@ -1,8 +1,25 @@
+//! # Pallet Archiver
+//!
+//! ## Overview
+//!
+//! This pallet allows users to create an archive record for a book.
+//! Only one record can be created for a specific book
+//!
+//! ## Interface
+//!
+//! ### Config
+//!
+//! ### Dispatchable functions
+//!
+//! * `archive_book(orgin, title, author, url, archiver, timestamp)` - Archive a specified book
+//!
+//! ### RPC query endpoints
+//!
+//! * `book_summary( hash(title + author) )` - Retrieve book summary from the archive
+
 #![cfg_attr(not(feature = "std"), no_std)]
 
-/// Edit this file to define custom logic or remove it if it is not needed.
-/// Learn more about FRAME and the core library of Substrate FRAME pallets:
-/// <https://docs.substrate.io/reference/frame-pallets/>
+// Re-export pallet items so that they can be accessed from the crate namespace.
 pub use pallet::*;
 
 #[cfg(test)]
@@ -13,16 +30,18 @@ mod tests;
 
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
-pub mod weights;
-pub use weights::*;
 
 #[frame_support::pallet]
 pub mod pallet {
 	use super::*;
+	use frame_support::inherent::Vec;
 	use frame_support::pallet_prelude::*;
+	use frame_support::sp_runtime::traits::Hash;
 	use frame_system::pallet_prelude::*;
+	use scale_info::prelude::format;
 
 	#[pallet::pallet]
+	#[pallet::without_storage_info]
 	pub struct Pallet<T>(_);
 
 	/// Configure the pallet by specifying the parameters and types on which it depends.
@@ -30,79 +49,96 @@ pub mod pallet {
 	pub trait Config: frame_system::Config {
 		/// Because this pallet emits events, it depends on the runtime's definition of an event.
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
-		/// Type representing the weight of this pallet
-		type WeightInfo: WeightInfo;
 	}
 
-	// The pallet's runtime storage items.
-	// https://docs.substrate.io/main-docs/build/runtime-storage/
-	#[pallet::storage]
-	#[pallet::getter(fn something)]
-	// Learn more about declaring storage items:
-	// https://docs.substrate.io/main-docs/build/runtime-storage/#declaring-storage-items
-	pub type Something<T> = StorageValue<_, u32>;
-
-	// Pallets use events to inform users when important changes are made.
-	// https://docs.substrate.io/main-docs/build/events-errors/
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// Event documentation should end with an array that provides descriptive names for event
-		/// parameters. [something, who]
-		SomethingStored { something: u32, who: T::AccountId },
+		/// Event emitted when a book is archived
+		BookArchived { who: T::AccountId },
 	}
 
-	// Errors inform users that something went wrong.
 	#[pallet::error]
 	pub enum Error<T> {
-		/// Error names should be descriptive.
-		NoneValue,
-		/// Errors should have helpful documentation associated with them.
-		StorageOverflow,
+		/// Book already exist in archive
+		BookAlreadyExistInArchive,
 	}
 
-	// Dispatchable functions allows users to interact with the pallet and invoke state changes.
+	/// Book summary
+	#[derive(Clone, Encode, Decode, Default, Eq, PartialEq, RuntimeDebug, TypeInfo)]
+	pub struct BookSummary<AccountId, BlockNumber> {
+		pub title: Vec<u8>,     // title of book
+		pub author: Vec<u8>,    // author of book
+		pub url: Vec<u8>,       // web url to off-chain storage
+		archiver: AccountId,    // account id of archiver
+		timestamp: BlockNumber, // time when book was archived
+	}
+
+	/// Archive storage
+	///
+	/// Maps a book hash to book summary
+	/// Book hash is Blake2 hash of book title and author
+	#[pallet::storage]
+	#[pallet::getter(fn book_summary)]
+	pub(super) type ArchiveStore<T: Config> = StorageMap<
+		_,
+		Blake2_128Concat,
+		T::Hash,
+		BookSummary<T::AccountId, T::BlockNumber>,
+		OptionQuery,
+	>;
+
+	// Dispatchable functions allow users to interact with the pallet and invoke state changes.
 	// These functions materialize as "extrinsics", which are often compared to transactions.
 	// Dispatchable functions must be annotated with a weight and must return a DispatchResult.
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// An example dispatchable that takes a singles value as a parameter, writes the value to
-		/// storage and emits an event. This function must be dispatched by a signed extrinsic.
-		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::do_something())]
-		pub fn do_something(origin: OriginFor<T>, something: u32) -> DispatchResult {
+		#[pallet::call_index(1)]
+		#[pallet::weight(100_000_000)]
+		pub fn archive_book(
+			origin: OriginFor<T>,
+			title: Vec<u8>,
+			author: Vec<u8>,
+			url: Vec<u8>,
+		) -> DispatchResult {
 			// Check that the extrinsic was signed and get the signer.
 			// This function will return an error if the extrinsic is not signed.
-			// https://docs.substrate.io/main-docs/build/origins/
-			let who = ensure_signed(origin)?;
+			let signer = ensure_signed(origin)?;
 
-			// Update storage.
-			<Something<T>>::put(something);
+			let title = title.to_ascii_lowercase();
+			let author = author.to_ascii_lowercase();
 
-			// Emit an event.
-			Self::deposit_event(Event::SomethingStored { something, who });
-			// Return a successful DispatchResultWithPostInfo
+			// Create book pre-signature
+			let pre_image = format!("{:?}{:?}", title, author,);
+
+			// Get book hash
+			let book_hash = T::Hashing::hash(&pre_image.as_bytes());
+
+			// Verify that title and author have not already been stored
+			ensure!(
+				!ArchiveStore::<T>::contains_key(&book_hash),
+				Error::<T>::BookAlreadyExistInArchive
+			);
+
+			// Get the block number from the FRAME System pallet.
+			let current_block = <frame_system::Pallet<T>>::block_number();
+
+			// Create specified book summary
+			let book_summary = BookSummary {
+				title,
+				author,
+				url,
+				archiver: signer.clone(),
+				timestamp: current_block,
+			};
+
+			// Store book summary in archive
+			ArchiveStore::<T>::insert(&book_hash, book_summary);
+
+			// Emit an event that the book was archived.
+			Self::deposit_event(Event::BookArchived { who: signer });
+
 			Ok(())
-		}
-
-		/// An example dispatchable that may throw a custom error.
-		#[pallet::call_index(1)]
-		#[pallet::weight(T::WeightInfo::cause_error())]
-		pub fn cause_error(origin: OriginFor<T>) -> DispatchResult {
-			let _who = ensure_signed(origin)?;
-
-			// Read a value from storage.
-			match <Something<T>>::get() {
-				// Return an error if the value has not been set.
-				None => return Err(Error::<T>::NoneValue.into()),
-				Some(old) => {
-					// Increment the value read from storage; will error in the event of overflow.
-					let new = old.checked_add(1).ok_or(Error::<T>::StorageOverflow)?;
-					// Update the value in storage with the incremented result.
-					<Something<T>>::put(new);
-					Ok(())
-				},
-			}
 		}
 	}
 }
